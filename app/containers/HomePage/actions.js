@@ -10,7 +10,14 @@ import { log } from '../../utils/log';
 import fileExplorerController from '../../data/file-explorer/controllers/FileExplorerController';
 import { checkIf } from '../../utils/checkIf';
 import { MTP_ERROR } from '../../enums/mtpError';
-import { DEVICES_DEFAULT_PATH } from '../../constants';
+import {
+  DEVICES_DEFAULT_PATH,
+  MTP_INIT_RETRY_MAX_ATTEMPTS,
+} from '../../constants';
+import {
+  isMtpInterfaceHeldBySystem,
+  releaseMtpInterfaceClaimants,
+} from '../../helpers/releaseMtpClaimants';
 import { analyticsService } from '../../services/analytics';
 
 const prefix = '@@Home';
@@ -237,6 +244,86 @@ export function disposeMtp({ deviceType, onSuccess, onError }, getState) {
   };
 }
 
+/**
+ * description - Decide whether a failed Kalam handshake is worth retrying
+ * after releasing the MTP interface from the macOS Image Capture daemons.
+ *
+ * `ErrorDeviceSetup` is what a claimed interface produces, so it always
+ * qualifies. `ErrorMtpDetectFailed` normally just means "no phone attached";
+ * it only qualifies when ioreg shows an MTP interface held by those daemons,
+ * so that refreshing without a phone never kills them.
+ *
+ * @param stderr - kalam errorType
+ * @return {Promise<boolean>}
+ */
+async function shouldRetryKalamInit(stderr) {
+  if (stderr === MTP_ERROR.ErrorDeviceSetup) {
+    return true;
+  }
+
+  if (stderr === MTP_ERROR.ErrorMtpDetectFailed) {
+    return (await isMtpInterfaceHeldBySystem()) === true;
+  }
+
+  return false;
+}
+
+/**
+ * description - Open a Kalam MTP session, retrying a handshake that failed
+ * because macOS (ptpcamerad / mscamerad-xpc) was holding the MTP interface.
+ *
+ * Upstream: https://github.com/ganeshrvel/openmtp/pull/483
+ *
+ * @param deviceType
+ * @return {Promise<{data: object, error: string|null, stderr: string|null}>}
+ */
+async function initializeKalamWithRetry({ deviceType }) {
+  checkIf(deviceType, 'string');
+
+  // When ioreg already shows the daemons holding the MTP interface, release
+  // it before the very first handshake. A failed handshake makes go-mtpfs
+  // reset the whole USB device (which also drops adb) and sleep for a
+  // second, giving launchd time to bring the daemons back.
+  if ((await isMtpInterfaceHeldBySystem()) === true) {
+    await releaseMtpInterfaceClaimants();
+  }
+
+  let result = await fileExplorerController.initialize({ deviceType });
+
+  /* eslint-disable no-await-in-loop */
+  for (let attempt = 1; attempt <= MTP_INIT_RETRY_MAX_ATTEMPTS; attempt += 1) {
+    if (!(await shouldRetryKalamInit(result?.stderr))) {
+      return result;
+    }
+
+    // drop any half-open handle from the failed attempt. Done before the
+    // release below, because everything between the release and the
+    // handshake is time the daemons can use to come back.
+    try {
+      await fileExplorerController.dispose({ deviceType });
+    } catch (e) {
+      log.error(e, 'initializeKalamWithRetry.dispose');
+    }
+
+    await releaseMtpInterfaceClaimants();
+
+    // launchd restarts the daemons within about a second and they reclaim
+    // the interface at once, so the handshake has to follow immediately.
+    result = await fileExplorerController.initialize({ deviceType });
+
+    log.info(
+      `attempt=${attempt} errorType=${result?.stderr ?? ''}`,
+      'initializeKalamWithRetry',
+      true,
+      true,
+      false
+    );
+  }
+  /* eslint-enable no-await-in-loop */
+
+  return result;
+}
+
 function initKalamMtp({ filePath, ignoreHidden, deviceType }, getState) {
   return async (dispatch) => {
     checkIf(filePath, 'string');
@@ -257,7 +344,7 @@ function initKalamMtp({ filePath, ignoreHidden, deviceType }, getState) {
 
       // if the app was expecting the user to allow access to mtp storage
       // then don't reinitialize mtp
-      const { error, stderr, data } = await fileExplorerController.initialize({
+      const { error, stderr, data } = await initializeKalamWithRetry({
         deviceType,
       });
 
