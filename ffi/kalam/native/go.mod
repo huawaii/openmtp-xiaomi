@@ -9,6 +9,12 @@ require (
 	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
 )
 
+// [openmtp-xiaomi] patched copy of go-mtpfs: Configure() no longer leaks a
+// claimed USB handle when the session cannot be opened after a reset, and it
+// closes a stale session left behind by macOS ptpcamerad. See
+// third_party/go-mtpfs/mtp/mtp.go.
+replace github.com/ganeshrvel/go-mtpfs => ./third_party/go-mtpfs
+
 ///##### Upgrade a package
 //go get github.com/<org-name>/<package-name>@<git-commit-hash>
 
